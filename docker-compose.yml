@@ -1,0 +1,363 @@
+version: '3.7'
+
+volumes:
+  airflow-volume:
+    name: "airflow-volume"
+    driver: local
+  airflow-database-volume:
+    name: "airflow-database-volume"
+    driver: local
+  postgres-server-volume:
+    name: "postgres-server-volume"
+    driver: local
+  metabase-app-volume:
+    name: "metabase-app-volume"
+    driver: local
+  minio-server-volume-1-1:
+    name: "minio-server-volume-1-1"
+    driver: local
+  minio-server-volume-1-2:
+    name: "minio-server-volume-1-2"
+    driver: local
+  minio-server-volume-2-1:
+    name: "minio-server-volume-2-1"
+    driver: local
+  minio-server-volume-2-2:
+    name: "minio-server-volume-2-2"
+    driver: local
+  minio-server-volume-3-1:
+    name: "minio-server-volume-3-1"
+    driver: local
+  minio-server-volume-3-2:
+    name: "minio-server-volume-3-2"
+    driver: local
+  minio-server-volume-4-1:
+    name: "minio-server-volume-4-1"
+    driver: local
+  minio-server-volume-4-2:
+    name: "minio-server-volume-4-2"
+    driver: local
+  spark-apps-volume:
+    name: "spark-apps-volume"
+    driver: local
+  spark-data-volume:
+    name: "spark-data-volume"
+    driver: local
+  spark-logs-volume:
+    name: "spark-logs-volume"
+    driver: local
+
+networks:
+  docker_network:
+      external: true
+
+
+# Configurações comuns aos servidores MinIO
+x-minio-common: &minio-common
+  image: minio/minio:RELEASE.2023-02-22T18-23-45Z
+  command: server --console-address ":9001" http://minio{1...4}/data{1...2}
+  expose:
+    - "9000"
+    - "9001"
+  environment:
+    MINIO_ROOT_USER: minioadmin
+    MINIO_ROOT_PASSWORD: minioadmin
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+    interval: 30s
+    timeout: 20s
+    retries: 3
+
+# Configurações comuns ao Apache Airflow
+x-airflow-common: &airflow-common
+  build:
+    dockerfile: ./docker/airflow/Dockerfile
+  user: "${AIRFLOW_UID}:0"
+  env_file:
+    - ./docker/airflow/.env
+  volumes:
+    - ./data/airflow/dags:/opt/airflow/dags
+    - ./data/airflow/logs:/opt/airflow/logs
+    - ./data/airflow/downloads:/opt/airflow/downloads
+    - ./data/airflow/plugins:/opt/airflow/plugins
+    - /var/run/docker.sock:/var/run/docker.sock
+    - ./data/airflow/spark-jars:/opt/airflow/spark-jars
+
+x-airflow-depends-on: &airflow-depends-on
+  depends_on:
+    airflow-database:
+      condition: service_healthy
+    airflow-init:
+      condition: service_completed_successfully
+
+
+# Configurações comuns ao Apache Spark
+x-spark-common: &spark-common
+  build: ./docker/spark
+  image: spark-cluster:3.4.1
+  volumes:
+      - spark-apps-volume:/opt/spark-apps
+      - spark-data-volume:/opt/spark-data
+      - spark-logs-volume:/opt/spark/spark-events
+  env_file:
+    - ./docker/spark/.env
+
+services:
+  ###################################################
+  # Servidores MinIO
+  #==================================================
+  minio-server-kevin:
+    <<: *minio-common
+    container_name: minio-server-kevin
+    hostname: minio1
+    volumes:
+      - minio-server-volume-1-1:/data1
+      - minio-server-volume-1-2:/data2
+    networks:
+      - docker_network
+
+  minio-server-dave:
+    <<: *minio-common
+    container_name: minio-server-dave
+    hostname: minio2
+    volumes:
+      - minio-server-volume-2-1:/data1
+      - minio-server-volume-2-2:/data2
+    networks:
+      - docker_network
+
+  minio-server-carl:
+    <<: *minio-common
+    container_name: minio-server-carl
+    hostname: minio3
+    volumes:
+      - minio-server-volume-3-1:/data1
+      - minio-server-volume-3-2:/data2
+    networks:
+      - docker_network
+
+  minio-server-bob:
+    <<: *minio-common
+    container_name: minio-server-bob
+    hostname: minio4
+    volumes:
+      - minio-server-volume-4-1:/data1
+      - minio-server-volume-4-2:/data2
+    networks:
+      - docker_network
+
+  minio-webserver:
+    container_name: minio-webserver
+    image: nginx:1.19.2-alpine
+    hostname: minio-webserver
+    volumes:
+      - ./docker/minio/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    depends_on:
+      - minio-server-bob
+      - minio-server-kevin
+      - minio-server-carl
+      - minio-server-dave
+    networks:
+      - docker_network
+
+
+  ###################################################
+  # Servidores Apache Airflow
+  #==================================================
+
+  airflow-database:
+    container_name: airflow-database
+    image: postgres:latest
+    ports:
+      - "5434:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    env_file:
+      - ./docker/airflow/.env
+    volumes:
+      - airflow-database-volume:/var/lib/postgresql/data
+    networks:
+      - docker_network
+
+  airflow-scheduler:
+    <<: [*airflow-common,*airflow-depends-on]
+    container_name: airflow-scheduler
+    command: scheduler
+    restart: on-failure
+    ports:
+      - "8793:8793"
+    networks:
+      - docker_network
+
+  airflow-webserver:
+    <<: [*airflow-common,*airflow-depends-on]
+    container_name: airflow-webserver
+    restart: always
+    command: webserver
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+    networks:
+        - docker_network
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins /sources/downloads
+        chmod 777 -R /sources/downloads
+        chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins,downloads}
+        exec /entrypoint airflow version
+    networks:
+      - docker_network
+
+  
+  ###################################################
+  # Servidor PostgreSQL
+  #==================================================
+  postgres-server:
+    container_name: postgres-server
+    hostname: postgres-server
+    image: postgres:latest
+    ports:
+      - "5431:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 5s
+      retries: 5
+    env_file:
+      - ./docker/postgresql/.env
+    volumes:
+      - postgres-server-volume:/var/lib/postgresql/data
+      - ./docker/postgresql/create-multiple-postgresql-databases.sh:/docker-entrypoint-initdb.d/01-create-db.sh
+    networks:
+      - docker_network
+  ###################################################
+  # Servidor Metabase
+  #==================================================
+  metabase-app:
+    container_name: metabase-app
+    image: metabase/metabase:v0.45.3
+    restart: always
+    ports:
+      - "3001:3000"
+    volumes:
+      - metabase-app-volume:/metabase-data
+    env_file:
+      - ./docker/metabase/.env
+    depends_on:
+      - postgres-server
+    links:
+      - postgres-server
+    networks:
+      - docker_network
+
+  ###################################################
+  # Cluster Apache Spark Standalone
+  #==================================================
+  spark-master:
+    <<: *spark-common
+    container_name: spark-master
+    hostname: spark-master
+    entrypoint: [ './entrypoint.sh', 'master' ]
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080" ]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    ports:
+      - '9090:8080'
+      - '7077:7077'
+    networks:
+      - docker_network
+
+  spark-history-server:
+    <<: *spark-common
+    container_name: spark-history
+    entrypoint: [ './entrypoint.sh', 'history' ]
+    depends_on:
+      - spark-master
+    ports:
+      - '18080:18080'
+    networks:
+      - docker_network
+
+  spark-worker-a:
+    <<: *spark-common
+    container_name: spark-worker-a
+    entrypoint: ['./entrypoint.sh', 'worker']
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_WORKER_CORES=3
+      - SPARK_WORKER_MEMORY=3G
+      - SPARK_DRIVER_MEMORY=3G
+      - SPARK_EXECUTOR_MEMORY=3G
+    ports:
+      - '9091:8080'
+      - '7000:7000'
+    networks:
+      - docker_network
+
+  spark-worker-b:
+    <<: *spark-common
+    container_name: spark-worker-b
+    entrypoint: ['./entrypoint.sh', 'worker']
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_WORKER_CORES=3
+      - SPARK_WORKER_MEMORY=3G
+      - SPARK_DRIVER_MEMORY=3G
+      - SPARK_EXECUTOR_MEMORY=3G
+    ports:
+      - '9092:8080'
+      - '7001:7000'
+    networks:
+      - docker_network
+
+  spark-worker-c:
+    <<: *spark-common
+    container_name: spark-worker-c
+    entrypoint: [ './entrypoint.sh', 'worker' ]
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_WORKER_CORES=3
+      - SPARK_WORKER_MEMORY=3G
+      - SPARK_DRIVER_MEMORY=3G
+      - SPARK_EXECUTOR_MEMORY=3G
+    ports:
+      - '9093:8080'
+      - '7002:7000'
+    networks:
+      - docker_network
+
+  spark-worker-d:
+    <<: *spark-common
+    container_name: spark-worker-d
+    entrypoint: [ './entrypoint.sh', 'worker' ]
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_WORKER_CORES=3
+      - SPARK_WORKER_MEMORY=3G
+      - SPARK_DRIVER_MEMORY=3G
+      - SPARK_EXECUTOR_MEMORY=3G
+    ports:
+      - '9094:8080'
+      - '7003:7000'
+    networks:
+      - docker_network
